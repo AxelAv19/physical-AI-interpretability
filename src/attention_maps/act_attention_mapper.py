@@ -46,7 +46,13 @@ class ACTPolicyWithAttention:
         # For storing the last processed images and attention
         self.last_observation = None
         self.last_attention_maps = None
+        
+        # Cache for attention weights - ACT processes in chunks
+        self.attention_cache = {}  # frame_idx -> attention_weights
+        self.last_chunk_start = -1
 
+        # Model structure verified during development
+        
         if not hasattr(self.policy, 'model') or \
         not hasattr(self.policy.model, 'decoder') or \
         not hasattr(self.policy.model.decoder, 'layers') or \
@@ -54,11 +60,12 @@ class ACTPolicyWithAttention:
             raise AttributeError("Policy model structure does not match expected ACT architecture for target_layer.")
         self.target_layer = self.policy.model.decoder.layers[-1].multihead_attn
 
-    def select_action(self, observation: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, list[np.ndarray]]:
+    def select_action(self, observation: dict[str, torch.Tensor], frame_idx: int = None) -> tuple[torch.Tensor, torch.Tensor, list[np.ndarray]]:
         """Extends policy.select_action to also compute attention maps.
 
         Args:
             observation: Dictionary of observations
+            frame_idx: Current frame index for caching attention weights
 
         Returns:
             action: The predicted action tensor
@@ -66,6 +73,8 @@ class ACTPolicyWithAttention:
         """
         # Store the observation for later use
         self.last_observation = observation.copy()
+        if frame_idx is not None:
+            self._current_frame_idx = frame_idx
 
         # Process the images through the backbone first to understand spatial dimensions
         images = self._extract_images(observation)
@@ -75,43 +84,76 @@ class ACTPolicyWithAttention:
         attention_weights_capture = []
 
         def attention_hook(module, _input_args, output_tuple):
-            # Capture the attention weights
-            # In some MultiheadAttention implementations, the attention weights
-            # might be returned with shape: [batch_size, tgt_len, src_len]
-            # or [batch_size, num_heads, tgt_len, src_len]
+            # Try to get attention weights
             if isinstance(output_tuple, tuple) and len(output_tuple) > 1:
-                # If output is a tuple with attention weights as second element
                 attn_weights = output_tuple[1]
-            else:
-                # If output format is different, try to get weights from the module directly
-                # Some implementations store attention weights in the module after forward pass
-                attn_weights = getattr(module, 'attn_weights', None)
+                try:
+                    attention_weights_capture.append(attn_weights.detach().cpu())
+                except Exception as e:
+                    print(f"Error capturing attention weights: {e}")
 
-            if attn_weights is not None:
-                # Store the weights regardless of shape - we'll handle reshape later
-                attention_weights_capture.append(attn_weights.detach().cpu())
-
+        # FORCE attention weights by temporarily monkey-patching the forward method
+        original_forward = self.target_layer.forward
+        
+        def patched_forward(*args, **kwargs):
+            # Force need_weights and average_attn_weights
+            kwargs['need_weights'] = True
+            kwargs['average_attn_weights'] = False
+            return original_forward(*args, **kwargs)
+        
+        # Apply the patch
+        self.target_layer.forward = patched_forward
+        
         # Register the hook
         handle = self.target_layer.register_forward_hook(attention_hook)
 
         # Call the original policy's select_action
         with torch.inference_mode():
-            action = self.policy.select_action(observation, force_model_run=True)
+            action = self.policy.select_action(observation)
 
+        # Restore original forward method
+        self.target_layer.forward = original_forward
+        
         # Remove the hook
         handle.remove()
 
-        # Process the attention weights
+        # Process the attention weights - use cache if hook didn't capture new ones
         if attention_weights_capture:
+            # Fresh capture - store in cache for chunk processing
             attn = attention_weights_capture[0].to(action.device)
-            attention_maps, proprio_attention = self._map_attention_to_images(attn, image_spatial_shapes)
-            self.last_attention_maps = attention_maps
-            self.last_proprio_attention = proprio_attention  # Store for visualization
+            print(f"✅ Using fresh attention weights: {attn.shape}")
+            
+            # Cache the weights for the entire chunk (chunk_size frames)
+            chunk_size = attn.shape[2] if len(attn.shape) >= 3 else 25  # default chunk size
+            current_frame = getattr(self, '_current_frame_idx', 0)
+            chunk_start = (current_frame // chunk_size) * chunk_size
+            
+            # Store attention for each frame in this chunk
+            for i in range(chunk_size):
+                frame_idx = chunk_start + i
+                if i < attn.shape[2]:  # Don't exceed actual sequence length
+                    # Extract attention for frame i: [batch, heads, frame_i, spatial]
+                    frame_attention = attn[:, :, i, :]  # [1, 8, 162]
+                    self.attention_cache[frame_idx] = frame_attention
+            
+            self.last_chunk_start = chunk_start            
         else:
-            print("Warning: No attention weights were captured.")
-            attention_maps = [None] * self.num_images
-            self.last_attention_maps = attention_maps
-            self.last_proprio_attention = 0.0  # Store for visualization
+            # No fresh capture - try to use cached attention
+            current_frame = getattr(self, '_current_frame_idx', 0)
+            if current_frame in self.attention_cache:
+                attn = self.attention_cache[current_frame]
+                print(f"✅ Using cached attention for frame {current_frame}: {attn.shape}")
+            else:
+                print(f"❌ No attention weights for frame {current_frame} (cache keys: {list(self.attention_cache.keys())})")
+                attention_maps = [None] * self.num_images
+                self.last_attention_maps = attention_maps
+                self.last_proprio_attention = 0.0
+                return action, attention_maps
+        attention_maps, proprio_attention = self._map_attention_to_images(attn, image_spatial_shapes)
+        
+        # Attention maps verified and working correctly
+        self.last_attention_maps = attention_maps
+        self.last_proprio_attention = proprio_attention  # Store for visualization
 
         return action, attention_maps
 

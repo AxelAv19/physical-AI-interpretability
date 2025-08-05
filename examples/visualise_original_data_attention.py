@@ -16,8 +16,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.common.policies.factory import make_policy
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.policies.factory import make_policy
 from lerobot.configs.policies import PreTrainedConfig
 
 from src.attention_maps import ACTPolicyWithAttention
@@ -167,7 +167,8 @@ def analyze_episode(dataset: LeRobotDataset,
                    episode_id: int,
                    device: torch.device,
                    output_dir: str,
-                   model_dtype: torch.dtype = torch.float32) -> Dict:
+                   model_dtype: torch.dtype = torch.float32,
+                   output_fps: int = None) -> Dict:
     """
     Run policy inference on an episode and analyze proprioceptive importance.
     
@@ -230,7 +231,7 @@ def analyze_episode(dataset: LeRobotDataset,
         # Run policy inference
         with torch.inference_mode():
             if hasattr(policy, 'select_action'):
-                result = policy.select_action(observation)
+                result = policy.select_action(observation, frame_idx=i)
                 
                 if isinstance(result, tuple):
                     # ACT policy with attention
@@ -287,11 +288,13 @@ def analyze_episode(dataset: LeRobotDataset,
         for i, cam_buffer in enumerate(attention_videos):
             if cam_buffer:
                 output_filename = f"{output_dir}/attention_ep{episode_id}_cam{i}_{timestamp_str}.mp4"
-                encode_video_ffmpeg(cam_buffer, output_filename, dataset.fps)
+                final_fps = output_fps if output_fps else dataset.fps
+                encode_video_ffmpeg(cam_buffer, output_filename, final_fps)
         
         # if side_by_side_buffer:
         output_filename_sbs = f"{output_dir}/attention_ep{episode_id}_combined_{timestamp_str}.mp4"
-        encode_video_ffmpeg(side_by_side_buffer, output_filename_sbs, dataset.fps)
+        final_fps = output_fps if output_fps else dataset.fps
+        encode_video_ffmpeg(side_by_side_buffer, output_filename_sbs, final_fps)
     
     # Analyze and save importance results
     analysis_results = {
@@ -318,6 +321,8 @@ def main():
                         help="Policy config overrides in key=value format")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device to use for inference")
+    parser.add_argument("--output-fps", type=int, default=None,
+                        help="Output video FPS (default: use dataset FPS)")
     parser.add_argument("--model-dtype", type=str, default="float32",
                         choices=["float32", "float16", "bfloat16"],
                         help="Model data type")
@@ -392,7 +397,8 @@ def main():
                 episode_id=episode_id,
                 device=device,
                 output_dir=args.output_dir,
-                model_dtype=model_dtype
+                model_dtype=model_dtype,
+                output_fps=args.output_fps
             )
             all_results.append(results)
             print(f"Episode {episode_id} analysis completed successfully")
