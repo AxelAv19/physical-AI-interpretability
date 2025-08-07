@@ -13,13 +13,18 @@ class ACTPolicyWithAttention:
     """Wrapper for ACTPolicy that provides transformer attention visualizations.
     """
 
-    def __init__(self, policy, image_shapes=None, specific_decoder_token_index: Optional[int] = None):
+    def __init__(self, policy, image_shapes=None, specific_decoder_token_index: Optional[int] = None,
+                 multi_layer_attention: bool = False, layer_indices: Optional[list[int]] = None,
+                 layer_combination: str = 'average'):
         """Initialize the wrapper with an ACTPolicy.
 
         Args:
             policy: An instance of ACTPolicy
             image_shapes: Optional list of image shapes [(H1, W1), (H2, W2), ...] if known in advance
             specific_decoder_token_index: experimental, allows visualising attention maps for a particular token rather than averaging all outputs.
+            multi_layer_attention: Whether to capture attention from multiple layers
+            layer_indices: Specific layer indices to capture attention from (if None, uses beginning/middle/end)
+            layer_combination: How to combine multi-layer attention ('average', 'max', 'last', 'first')
         """
         self.policy = policy
         self.config = policy.config
@@ -46,26 +51,62 @@ class ACTPolicyWithAttention:
         # For storing the last processed images and attention
         self.last_observation = None
         self.last_attention_maps = None
-        
-        # Cache for attention weights - ACT processes in chunks
-        self.attention_cache = {}  # frame_idx -> attention_weights
-        self.last_chunk_start = -1
+
+        # Multi-layer attention configuration
+        self.multi_layer_attention = multi_layer_attention
+        self.layer_combination = layer_combination
+        self.last_multi_layer_attention = {}  # layer_idx -> attention_maps
 
         # Model structure verified during development
-        
         if not hasattr(self.policy, 'model') or \
         not hasattr(self.policy.model, 'decoder') or \
         not hasattr(self.policy.model.decoder, 'layers') or \
         not self.policy.model.decoder.layers:
             raise AttributeError("Policy model structure does not match expected ACT architecture for target_layer.")
-        self.target_layer = self.policy.model.decoder.layers[-1].multihead_attn
+        
+        # Setup target layers
+        self.decoder_layers = self.policy.model.decoder.layers
+        self.num_decoder_layers = len(self.decoder_layers)
+        
+        if self.multi_layer_attention:
+            # Determine which layers to capture attention from
+            if layer_indices is None:
+                # Default: capture from beginning (0), middle, and end layers
+                if self.num_decoder_layers >= 3:
+                    middle_idx = self.num_decoder_layers // 2
+                    self.target_layer_indices = [0, middle_idx, -1]  # beginning, middle, end
+                elif self.num_decoder_layers == 2:
+                    self.target_layer_indices = [0, -1]  # beginning and end
+                else:
+                    self.target_layer_indices = [0]  # just the first layer
+            else:
+                # Use specified layer indices, convert negative indices
+                self.target_layer_indices = []
+                for idx in layer_indices:
+                    if idx < 0:
+                        actual_idx = self.num_decoder_layers + idx
+                    else:
+                        actual_idx = idx
+                    
+                    if 0 <= actual_idx < self.num_decoder_layers:
+                        self.target_layer_indices.append(actual_idx)
+                    else:
+                        print(f"Warning: Layer index {idx} (actual: {actual_idx}) is out of bounds for {self.num_decoder_layers} layers")
+            
+            self.target_layers = [self.decoder_layers[i].multihead_attn for i in self.target_layer_indices]
+            print(f"Multi-layer attention enabled: capturing from {len(self.target_layers)} layers at indices {self.target_layer_indices}")
+            print(f"Layer combination method: {self.layer_combination}")
+        else:
+            # Single layer mode (backward compatibility)
+            self.target_layer = self.decoder_layers[-1].multihead_attn
+            self.target_layers = [self.target_layer]
+            self.target_layer_indices = [-1]
 
-    def select_action(self, observation: dict[str, torch.Tensor], frame_idx: int = None) -> tuple[torch.Tensor, torch.Tensor, list[np.ndarray]]:
+    def select_action(self, observation: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, list[np.ndarray]]:
         """Extends policy.select_action to also compute attention maps.
 
         Args:
             observation: Dictionary of observations
-            frame_idx: Current frame index for caching attention weights
 
         Returns:
             action: The predicted action tensor
@@ -73,85 +114,110 @@ class ACTPolicyWithAttention:
         """
         # Store the observation for later use
         self.last_observation = observation.copy()
-        if frame_idx is not None:
-            self._current_frame_idx = frame_idx
 
         # Process the images through the backbone first to understand spatial dimensions
         images = self._extract_images(observation)
         image_spatial_shapes = self._get_image_spatial_shapes(images)
 
-        # Set up hook to capture attention weights
-        attention_weights_capture = []
+        # Set up hooks to capture attention weights from multiple layers
+        multi_layer_attention_capture = {}  # layer_idx -> attention_weights
+        
+        def make_attention_hook(layer_idx):
+            def attention_hook(module, _input_args, output_tuple):
+                # Try to get attention weights
+                if isinstance(output_tuple, tuple) and len(output_tuple) > 1:
+                    attn_weights = output_tuple[1]
+                    try:
+                        multi_layer_attention_capture[layer_idx] = attn_weights.detach().cpu()
+                    except Exception as e:
+                        print(f"Error capturing attention weights from layer {layer_idx}: {e}")
+            return attention_hook
 
-        def attention_hook(module, _input_args, output_tuple):
-            # Try to get attention weights
-            if isinstance(output_tuple, tuple) and len(output_tuple) > 1:
-                attn_weights = output_tuple[1]
-                try:
-                    attention_weights_capture.append(attn_weights.detach().cpu())
-                except Exception as e:
-                    print(f"Error capturing attention weights: {e}")
-
-        # FORCE attention weights by temporarily monkey-patching the forward method
-        original_forward = self.target_layer.forward
+        # FORCE attention weights by monkey-patching forward methods and registering hooks
+        original_forwards = []
+        handles = []
         
-        def patched_forward(*args, **kwargs):
-            # Force need_weights and average_attn_weights
-            kwargs['need_weights'] = True
-            kwargs['average_attn_weights'] = False
-            return original_forward(*args, **kwargs)
-        
-        # Apply the patch
-        self.target_layer.forward = patched_forward
-        
-        # Register the hook
-        handle = self.target_layer.register_forward_hook(attention_hook)
+        for i, target_layer in enumerate(self.target_layers):
+            layer_idx = self.target_layer_indices[i]
+            
+            # Store original forward method
+            original_forward = target_layer.forward
+            original_forwards.append(original_forward)
+            
+            # Create patched forward method
+            def make_patched_forward(orig_forward):
+                def patched_forward(*args, **kwargs):
+                    kwargs['need_weights'] = True
+                    kwargs['average_attn_weights'] = False
+                    return orig_forward(*args, **kwargs)
+                return patched_forward
+            
+            # Apply the patch
+            target_layer.forward = make_patched_forward(original_forward)
+            
+            # Register the hook
+            hook = make_attention_hook(layer_idx)
+            handle = target_layer.register_forward_hook(hook)
+            handles.append(handle)
 
         # Call the original policy's select_action
         with torch.inference_mode():
             action = self.policy.select_action(observation)
 
-        # Restore original forward method
-        self.target_layer.forward = original_forward
+        # Restore original forward methods
+        for i, target_layer in enumerate(self.target_layers):
+            target_layer.forward = original_forwards[i]
         
-        # Remove the hook
-        handle.remove()
+        # Remove all hooks
+        for handle in handles:
+            handle.remove()
 
-        # Process the attention weights - use cache if hook didn't capture new ones
-        if attention_weights_capture:
-            # Fresh capture - store in cache for chunk processing
-            attn = attention_weights_capture[0].to(action.device)
-            print(f"✅ Using fresh attention weights: {attn.shape}")
+        # Process the multi-layer attention weights
+        if multi_layer_attention_capture:
+            layer_indices = list(multi_layer_attention_capture.keys())
+            print(f"✅ Captured attention from layers: {layer_indices}")
             
-            # Cache the weights for the entire chunk (chunk_size frames)
-            chunk_size = attn.shape[2] if len(attn.shape) >= 3 else 25  # default chunk size
-            current_frame = getattr(self, '_current_frame_idx', 0)
-            chunk_start = (current_frame // chunk_size) * chunk_size
+            # Store individual layer attentions
+            layer_attention_maps = {}
+            layer_statistics = {}
             
-            # Store attention for each frame in this chunk
-            for i in range(chunk_size):
-                frame_idx = chunk_start + i
-                if i < attn.shape[2]:  # Don't exceed actual sequence length
-                    # Extract attention for frame i: [batch, heads, frame_i, spatial]
-                    frame_attention = attn[:, :, i, :]  # [1, 8, 162]
-                    self.attention_cache[frame_idx] = frame_attention
+            for layer_idx, attn_weights in multi_layer_attention_capture.items():
+                attn = attn_weights.to(action.device)
+                layer_attention_maps[layer_idx], layer_proprio = self._map_attention_to_images(attn, image_spatial_shapes)
+                
+                # Compute statistics for this layer
+                valid_maps = [m for m in layer_attention_maps[layer_idx] if m is not None]
+                if valid_maps:
+                    # Compute attention statistics
+                    all_values = np.concatenate([m.flatten() for m in valid_maps])
+                    stats = {
+                        'mean': np.mean(all_values),
+                        'std': np.std(all_values),
+                        'max': np.max(all_values),
+                        'min': np.min(all_values),
+                        'entropy': -np.sum(all_values * np.log(all_values + 1e-10))  # attention entropy
+                    }
+                    layer_statistics[layer_idx] = stats
+                    
+                    print(f"   Layer {layer_idx}: {attn.shape} -> {len(valid_maps)} maps")
+                    print(f"     Stats - Mean: {stats['mean']:.4f}, Max: {stats['max']:.4f}, Entropy: {stats['entropy']:.2f}")
+                else:
+                    print(f"   Layer {layer_idx}: {attn.shape} -> 0 valid maps")
             
-            self.last_chunk_start = chunk_start            
+            # Store all layer results
+            self.last_multi_layer_attention = layer_attention_maps
+            
+            # Combine layers according to the specified method
+            attention_maps, proprio_attention = self._combine_layer_attention(layer_attention_maps, image_spatial_shapes)
+            
         else:
-            # No fresh capture - try to use cached attention
-            current_frame = getattr(self, '_current_frame_idx', 0)
-            if current_frame in self.attention_cache:
-                attn = self.attention_cache[current_frame]
-                print(f"✅ Using cached attention for frame {current_frame}: {attn.shape}")
-            else:
-                print(f"❌ No attention weights for frame {current_frame} (cache keys: {list(self.attention_cache.keys())})")
-                attention_maps = [None] * self.num_images
-                self.last_attention_maps = attention_maps
-                self.last_proprio_attention = 0.0
-                return action, attention_maps
-        attention_maps, proprio_attention = self._map_attention_to_images(attn, image_spatial_shapes)
+            print(f"❌ No attention weights captured from any layer")
+            attention_maps = [None] * self.num_images
+            self.last_attention_maps = attention_maps
+            self.last_proprio_attention = 0.0
+            return action, attention_maps
         
-        # Attention maps verified and working correctly
+        # Attention maps processed
         self.last_attention_maps = attention_maps
         self.last_proprio_attention = proprio_attention  # Store for visualization
 
@@ -352,6 +418,74 @@ class ACTPolicyWithAttention:
             final_normalized_attention_maps.append(normalized_map)
 
         return final_normalized_attention_maps, normalized_proprio_attention
+
+    def _combine_layer_attention(self, 
+                               layer_attention_maps: dict[int, list[np.ndarray]], 
+                               image_spatial_shapes: list[tuple[int, int]]) -> tuple[list[np.ndarray], float]:
+        """Combine attention maps from multiple layers into a single set of attention maps.
+        
+        Args:
+            layer_attention_maps: Dictionary mapping layer_idx -> list of attention maps
+            image_spatial_shapes: List of (height, width) tuples for feature maps
+            
+        Returns:
+            Tuple of combined attention maps and averaged proprioception attention
+        """
+        if not layer_attention_maps:
+            return [None] * self.num_images, 0.0
+        
+        # Get all layer indices and sort them
+        layer_indices = sorted(layer_attention_maps.keys())
+        num_layers = len(layer_indices)
+        
+        print(f"Combining attention from {num_layers} layers using method: {self.layer_combination}")
+        
+        # Initialize combined attention maps
+        combined_attention_maps = []
+        combined_proprio_attention = 0.0
+        
+        # Combine attention for each camera
+        for cam_idx in range(self.num_images):
+            # Collect attention maps from all layers for this camera
+            layer_maps = []
+            for layer_idx in layer_indices:
+                if cam_idx < len(layer_attention_maps[layer_idx]):
+                    attn_map = layer_attention_maps[layer_idx][cam_idx]
+                    if attn_map is not None:
+                        layer_maps.append(attn_map)
+            
+            if not layer_maps:
+                combined_attention_maps.append(None)
+                continue
+            
+            # Combine the maps according to the specified method
+            if self.layer_combination == 'average':
+                # Average all layers
+                combined_map = np.mean(layer_maps, axis=0)
+            elif self.layer_combination == 'max':
+                # Take element-wise maximum
+                combined_map = np.maximum.reduce(layer_maps)
+            elif self.layer_combination == 'last':
+                # Use the last (deepest) layer
+                combined_map = layer_maps[-1]
+            elif self.layer_combination == 'first':
+                # Use the first (shallowest) layer
+                combined_map = layer_maps[0]
+            elif self.layer_combination == 'weighted_average':
+                # Weighted average - give more weight to later layers
+                weights = np.array([i+1 for i in range(len(layer_maps))])
+                weights = weights / weights.sum()
+                combined_map = np.average(layer_maps, axis=0, weights=weights)
+            else:
+                print(f"Warning: Unknown layer combination method '{self.layer_combination}', using 'average'")
+                combined_map = np.mean(layer_maps, axis=0)
+            
+            combined_attention_maps.append(combined_map)
+        
+        # For proprioception, just average across layers (could be improved)
+        combined_proprio_attention = 0.0  # Simplified for now
+        
+        return combined_attention_maps, combined_proprio_attention
 
     def visualize_attention(self,
                         images: Optional[list[torch.Tensor]] = None,

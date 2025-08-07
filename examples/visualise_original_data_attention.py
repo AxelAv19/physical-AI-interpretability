@@ -75,7 +75,9 @@ def encode_video_ffmpeg(frames, output_filename, fps, pix_fmt_in="bgr24"):
     except Exception as e:
         print(f"An unexpected error occurred during video encoding for {output_filename}: {e}")
 
-def load_policy(policy_path: str, dataset_meta, policy_overrides: list = None) -> Tuple[torch.nn.Module, dict]:
+def load_policy(policy_path: str, dataset_meta, policy_overrides: list = None,
+                multi_layer_attention: bool = False, layer_indices: list = None,
+                layer_combination: str = 'average') -> Tuple[torch.nn.Module, dict]:
     """Load and initialize a policy from checkpoint."""
     
     # Load regular LeRobot policy
@@ -92,7 +94,12 @@ def load_policy(policy_path: str, dataset_meta, policy_overrides: list = None) -
 
     # NOTE: policy has to be an ACT policy for this to work
     policy = make_policy(policy_cfg, ds_meta=dataset_meta)
-    policy = ACTPolicyWithAttention(policy)
+    policy = ACTPolicyWithAttention(
+        policy,
+        multi_layer_attention=multi_layer_attention,
+        layer_indices=layer_indices,
+        layer_combination=layer_combination
+    )
         
     return policy, policy_cfg
 
@@ -168,7 +175,8 @@ def analyze_episode(dataset: LeRobotDataset,
                    device: torch.device,
                    output_dir: str,
                    model_dtype: torch.dtype = torch.float32,
-                   output_fps: int = None) -> Dict:
+                   output_fps: int = None,
+                   save_individual_layers: bool = False) -> Dict:
     """
     Run policy inference on an episode and analyze proprioceptive importance.
     
@@ -188,6 +196,8 @@ def analyze_episode(dataset: LeRobotDataset,
     # Initialize storage for results
     attention_videos = None
     side_by_side_buffer = []
+    layer_videos = {}  # layer_idx -> list of video buffers per camera
+    layer_side_by_side = {}  # layer_idx -> combined buffer
     actions_predicted = []
     actions_ground_truth = []
     timestamps = []
@@ -231,7 +241,7 @@ def analyze_episode(dataset: LeRobotDataset,
         # Run policy inference
         with torch.inference_mode():
             if hasattr(policy, 'select_action'):
-                result = policy.select_action(observation, frame_idx=i)
+                result = policy.select_action(observation)
                 
                 if isinstance(result, tuple):
                     # ACT policy with attention
@@ -248,8 +258,15 @@ def analyze_episode(dataset: LeRobotDataset,
                         num_cameras = len(visualizations)
                         attention_videos = [[] for _ in range(num_cameras)]
                         print(f"Detected {num_cameras} camera views for attention visualization")
+                        
+                        # Initialize individual layer buffers if multi-layer attention is enabled
+                        if save_individual_layers and hasattr(policy, 'multi_layer_attention') and policy.multi_layer_attention:
+                            if hasattr(policy, 'last_multi_layer_attention'):
+                                for layer_idx in policy.last_multi_layer_attention.keys():
+                                    layer_videos[layer_idx] = [[] for _ in range(num_cameras)]
+                                    layer_side_by_side[layer_idx] = []
                     
-                    # Store attention frames
+                    # Store combined attention frames
                     if attention_videos is not None:
                         valid_frames_this_step = []
                         for j, vis in enumerate(visualizations):
@@ -265,6 +282,32 @@ def analyze_episode(dataset: LeRobotDataset,
                             if all(f.shape[0] == first_height for f in valid_frames_this_step):
                                 side_by_side_frame = np.hstack(valid_frames_this_step)
                                 side_by_side_buffer.append(side_by_side_frame)
+                    
+                    # Store individual layer visualizations
+                    if save_individual_layers and hasattr(policy, 'multi_layer_attention') and policy.multi_layer_attention:
+                        if hasattr(policy, 'last_multi_layer_attention'):
+                            for layer_idx, layer_attention_maps in policy.last_multi_layer_attention.items():
+                                # Generate visualizations for this specific layer
+                                layer_visualizations = policy.visualize_attention(
+                                    attention_maps=layer_attention_maps,
+                                    observation=observation,
+                                )
+                                
+                                if layer_idx in layer_videos and layer_visualizations:
+                                    layer_valid_frames = []
+                                    for j, vis in enumerate(layer_visualizations):
+                                        if vis is not None and j < len(layer_videos[layer_idx]):
+                                            layer_videos[layer_idx][j].append(vis.copy())
+                                            layer_valid_frames.append(vis.copy())
+                                        else:
+                                            layer_valid_frames.append(None)
+                                    
+                                    # Create side-by-side frame for this layer
+                                    if len(layer_valid_frames) == num_cameras and all(f is not None for f in layer_valid_frames):
+                                        first_height = layer_valid_frames[0].shape[0]
+                                        if all(f.shape[0] == first_height for f in layer_valid_frames):
+                                            layer_side_by_side_frame = np.hstack(layer_valid_frames)
+                                            layer_side_by_side[layer_idx].append(layer_side_by_side_frame)
                 else:
                     action = result
                     
@@ -283,7 +326,7 @@ def analyze_episode(dataset: LeRobotDataset,
     os.makedirs(output_dir, exist_ok=True)
     timestamp_str = time.strftime("%Y%m%d-%H%M%S")
     
-    # Save attention videos
+    # Save combined attention videos
     if attention_videos:
         for i, cam_buffer in enumerate(attention_videos):
             if cam_buffer:
@@ -291,10 +334,28 @@ def analyze_episode(dataset: LeRobotDataset,
                 final_fps = output_fps if output_fps else dataset.fps
                 encode_video_ffmpeg(cam_buffer, output_filename, final_fps)
         
-        # if side_by_side_buffer:
-        output_filename_sbs = f"{output_dir}/attention_ep{episode_id}_combined_{timestamp_str}.mp4"
-        final_fps = output_fps if output_fps else dataset.fps
-        encode_video_ffmpeg(side_by_side_buffer, output_filename_sbs, final_fps)
+        # Save combined side-by-side video
+        if side_by_side_buffer:
+            output_filename_sbs = f"{output_dir}/attention_ep{episode_id}_combined_{timestamp_str}.mp4"
+            final_fps = output_fps if output_fps else dataset.fps
+            encode_video_ffmpeg(side_by_side_buffer, output_filename_sbs, final_fps)
+    
+    # Save individual layer videos
+    if save_individual_layers and layer_videos:
+        for layer_idx, layer_cam_buffers in layer_videos.items():
+            # Save per-camera videos for this layer
+            for i, cam_buffer in enumerate(layer_cam_buffers):
+                if cam_buffer:
+                    output_filename = f"{output_dir}/attention_ep{episode_id}_layer{layer_idx}_cam{i}_{timestamp_str}.mp4"
+                    final_fps = output_fps if output_fps else dataset.fps
+                    encode_video_ffmpeg(cam_buffer, output_filename, final_fps)
+            
+            # Save combined side-by-side video for this layer
+            if layer_idx in layer_side_by_side and layer_side_by_side[layer_idx]:
+                output_filename_sbs = f"{output_dir}/attention_ep{episode_id}_layer{layer_idx}_combined_{timestamp_str}.mp4"
+                final_fps = output_fps if output_fps else dataset.fps
+                encode_video_ffmpeg(layer_side_by_side[layer_idx], output_filename_sbs, final_fps)
+                print(f"Saved layer {layer_idx} attention video: {output_filename_sbs}")
     
     # Analyze and save importance results
     analysis_results = {
@@ -323,6 +384,15 @@ def main():
                         help="Device to use for inference")
     parser.add_argument("--output-fps", type=int, default=None,
                         help="Output video FPS (default: use dataset FPS)")
+    parser.add_argument("--multi-layer-attention", action="store_true",
+                        help="Enable multi-layer attention capture")
+    parser.add_argument("--layer-indices", type=int, nargs="*", default=None,
+                        help="Specific layer indices to capture (e.g., --layer-indices 0 2 -1)")
+    parser.add_argument("--layer-combination", type=str, default="average",
+                        choices=["average", "max", "last", "first", "weighted_average"],
+                        help="How to combine multi-layer attention")
+    parser.add_argument("--save-individual-layers", action="store_true",
+                        help="Save separate videos for each layer (only with --multi-layer-attention)")
     parser.add_argument("--model-dtype", type=str, default="float32",
                         choices=["float32", "float16", "bfloat16"],
                         help="Model data type")
@@ -369,7 +439,10 @@ def main():
         policy, policy_cfg = load_policy(
             args.policy_path,
             dataset.meta,
-            args.policy_overrides
+            args.policy_overrides,
+            args.multi_layer_attention,
+            args.layer_indices,
+            args.layer_combination
         )
         
         if hasattr(policy, 'model'):
@@ -398,7 +471,8 @@ def main():
                 device=device,
                 output_dir=args.output_dir,
                 model_dtype=model_dtype,
-                output_fps=args.output_fps
+                output_fps=args.output_fps,
+                save_individual_layers=args.save_individual_layers
             )
             all_results.append(results)
             print(f"Episode {episode_id} analysis completed successfully")
